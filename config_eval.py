@@ -25,7 +25,7 @@ class wm_args:
     num_workers=4
     down_sample=3 # downsample 15hz to 5hz
     skip_step = 1
-    
+
 
     # logs parameters
     debug = False
@@ -97,16 +97,22 @@ class wm_args:
         self.z_min = self.z_min_dict.get(self.task_type, 0.18)
         # Default task_name
         self.task_name = f"Rollouts_interact_pi_eval"
-        
+
         if self.task_type == "replay":
             self.task_name = "Rollouts_replay"
 
         # Configure per-task eval sets
+        #if self.task_type == "replay":
+        #    self.val_dataset_dir = "dataset_example/droid_subset"
+        #    self.start_idx = [8, 14, 8] * len(self.val_id)
+        #    self.instruction = [""] * len(self.val_id)
+        #    self.task_name = "Rollouts_replay"
+
         if self.task_type == "replay":
-            self.val_dataset_dir = "dataset_example/droid_subset"
-            self.val_id = ["899", "18599","199",]
-            self.start_idx = [8, 14, 8] * len(self.val_id)
-            self.instruction = [""] * len(self.val_id)
+            self.val_dataset_dir = "dataset_example/rh20t"
+            self.val_id = ["0004"]
+            self.start_idx = [0]
+            self.instruction = [""]
             self.task_name = "Rollouts_replay"
 
         elif self.task_type == "keyboard":
@@ -123,13 +129,13 @@ class wm_args:
             repeat_num = 2
             self.val_id = ['0000','0001','0002','0003','0004','0005','0006','0007','0008','0009']*repeat_num
             self.start_idx = [0]*len(self.val_id)
-            self.instruction = ['pick up the blue block and place in white plate', 
-                                'pick up the blue block and place in white plate', 
+            self.instruction = ['pick up the blue block and place in white plate',
                                 'pick up the blue block and place in white plate',
-                                'pick up the blue block and place in white plate', 
-                                'pick up the blue block and place in white plate', 
+                                'pick up the blue block and place in white plate',
+                                'pick up the blue block and place in white plate',
+                                'pick up the blue block and place in white plate',
                                 'pick up the green block and place in white plate',
-                                'pick up the green block and place in white plate', 
+                                'pick up the green block and place in white plate',
                                 'pick up the green block and place in white plate',
                                 'pick up the red block and place in white plate',
                                 'pick up the red block and place in white plate']*repeat_num
@@ -147,8 +153,8 @@ class wm_args:
             repeat_num = 4
             self.val_id = ['0000','0001','0002','0003','0004']*repeat_num
             self.start_idx = [0] * len(self.val_id)
-            self.instruction = ['moving the towel from left to right', 
-                                'moving the towel from right to left', 
+            self.instruction = ['moving the towel from left to right',
+                                'moving the towel from right to left',
                                 'moving the towel from left to right',
                                 'moving the towel from left to right',
                                 'moving the towel from left to right']*repeat_num
@@ -180,7 +186,7 @@ class wm_args:
                                 "stack the blue block on the red block",
                                 "stack the blue block on the red block",
                                 "stack the green block on the red block",]*repeat_num
-        
+
         elif self.task_type == 'drawer':
             self.val_dataset_dir = 'dataset_example/droid_new_setup_eval/drawer'
             repeat_num = 4
@@ -188,6 +194,6 @@ class wm_args:
             self.start_idx = [10]*len(self.val_id)
             self.instruction = ['pick up the sponge and place in the drawer', 'pick up the sponge and place in the drawer', 'pick up the sponge and place in the drawer', 'pick up the sponge and place in the drawer', 'pick up the sponge and place in the drawer']
             self.policy_skip_step = 3
-        
+
         else:
             raise ValueError(f"Unknown task type: {self.task_type}")

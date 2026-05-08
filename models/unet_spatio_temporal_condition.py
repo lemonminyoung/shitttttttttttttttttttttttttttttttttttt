@@ -16,6 +16,71 @@ from diffusers.models.unets.unet_3d_blocks import UNetMidBlockSpatioTemporal, ge
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
+class ObjectCrossAttentionAdapter(nn.Module):
+    """
+    Decoupled cross-attention adapter for object conditioning.
+
+    Placed after the existing action cross-attention; does NOT modify
+    action encoder_hidden_states.
+
+    h attends to obj_tokens:
+      q = LayerNorm(h) projected to embed_dim
+      k = v = LayerNorm(obj_tokens)
+      out = h + sigmoid(gate) * out_proj(attn(q, k, v))
+
+    gate initialised to -6.0 → sigmoid ≈ 0.0025, starts near-zero.
+    out_proj is zero-initialised → residual is exactly 0 at init.
+    """
+
+    def __init__(
+        self,
+        h_dim:     int = 1280,   # spatial feature dim (mid block = 1280)
+        obj_dim:   int = 1024,   # object token dim from ObjectStateEncoder
+        embed_dim: int = 1024,   # internal attention dim
+        num_heads: int = 8,
+    ):
+        super().__init__()
+        self.norm_h   = nn.LayerNorm(h_dim)
+        self.norm_obj = nn.LayerNorm(obj_dim)
+
+        # Project spatial features to attention embed_dim (h_dim may differ from embed_dim)
+        self.q_proj = nn.Linear(h_dim, embed_dim, bias=False)
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_first=True,
+            kdim=obj_dim,
+            vdim=obj_dim,
+        )
+
+        # Zero-init: residual contribution starts at exactly 0
+        self.out_proj = nn.Linear(embed_dim, h_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+        self.gate = nn.Parameter(torch.tensor(-6.0))
+
+    def forward(
+        self,
+        h:                torch.Tensor,          # [B*F, L, h_dim]
+        obj_tokens:       torch.Tensor,          # [B*F, N, obj_dim]
+        key_padding_mask: Optional[torch.Tensor] = None,  # [B*F, N] bool, True=ignore
+    ) -> torch.Tensor:                           # [B*F, L, h_dim]
+        q = self.q_proj(self.norm_h(h))          # [B*F, L, embed_dim]
+        kv = self.norm_obj(obj_tokens)           # [B*F, N, obj_dim]
+
+        attn_out, _ = self.attn(
+            query=q,
+            key=kv,
+            value=kv,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )  # [B*F, L, embed_dim]
+
+        return h + torch.sigmoid(self.gate) * self.out_proj(attn_out)
+
+
 @dataclass
 class UNetSpatioTemporalConditionOutput(BaseOutput):
     """
@@ -245,6 +310,15 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
             padding=1,
         )
 
+        # Object cross-attention adapter — mid block only (first stage)
+        # h_dim = block_out_channels[-1] (1280 for SVD default)
+        self.mid_block_obj_adapter = ObjectCrossAttentionAdapter(
+            h_dim=block_out_channels[-1],
+            obj_dim=1024,
+            embed_dim=1024,
+            num_heads=8,
+        )
+
     @property
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
         r"""
@@ -357,7 +431,9 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
         encoder_hidden_states: torch.Tensor,
         added_time_ids: torch.Tensor,
         return_dict: bool = True,
-        frame_level_cond=False,
+        frame_level_cond: bool = False,
+        object_hidden_states: Optional[torch.Tensor] = None,   # [B, F, N, 1024]
+        object_padding_mask:  Optional[torch.Tensor] = None,   # [B, F, N] bool, True=ignore
     ) -> Union[UNetSpatioTemporalConditionOutput, Tuple]:
         r"""
         The [`UNetSpatioTemporalConditionModel`] forward method.
@@ -440,12 +516,22 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
         # )
 
         ############################# newly added to support frame_level pose conditioning ########################################
-        # print('new one!!!!!!!!!')
         if not frame_level_cond:
             encoder_hidden_states = encoder_hidden_states.repeat_interleave(num_frames, dim=0)
         else:
-            encoder_hidden_states = encoder_hidden_states.reshape(batch_size * num_frames, -1, encoder_hidden_states.shape[-1])
+            # frame_level_cond=True: (B, num_frames, D) → (B*num_frames, 1, D)
+            encoder_hidden_states = encoder_hidden_states.reshape(
+                batch_size * num_frames, 1, encoder_hidden_states.shape[-1]
+            )
         ############################################################################################################################
+
+        # Object hidden states: (B, F, N, 1024) → (B*F, N, 1024)
+        obj_tokens_flat = None
+        obj_mask_flat   = None
+        if object_hidden_states is not None:
+            obj_tokens_flat = object_hidden_states.flatten(0, 1)   # (B*F, N, 1024)
+            if object_padding_mask is not None:
+                obj_mask_flat = object_padding_mask.flatten(0, 1)  # (B*F, N)
 
         # 2. pre-process
         sample = self.conv_in(sample)
@@ -477,6 +563,16 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
             encoder_hidden_states=encoder_hidden_states,
             image_only_indicator=image_only_indicator,
         )
+
+        # Object cross-attention adapter (mid block only)
+        if obj_tokens_flat is not None:
+            bf, c, h, w = sample.shape
+            # (B*F, C, H, W) → (B*F, H*W, C) for sequence attention
+            sample_seq = sample.flatten(2).transpose(1, 2)
+            sample_seq = self.mid_block_obj_adapter(
+                sample_seq, obj_tokens_flat, key_padding_mask=obj_mask_flat
+            )
+            sample = sample_seq.transpose(1, 2).reshape(bf, c, h, w)
 
         # 5. up
         for i, upsample_block in enumerate(self.up_blocks):

@@ -50,7 +50,7 @@ class Dynamics(nn.Module):
         # self.CLS = nn.Parameter(torch.zeros(1, 1, hidden_size), requires_grad=True)
         input_dim = int(action_dim * (action_num+1))
         output_dim = int(action_num * action_dim)
-        self.net = nn.Sequential(   
+        self.net = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.SiLU(),
             nn.Linear(512, 512),
@@ -87,7 +87,8 @@ class Dynamics(nn.Module):
             loss = F.mse_loss(pred, joint_delta)  # (B, T, 7)
             return loss
 
-        pred = pred.detach().cpu().numpy()  # (B, T, 7)
+        #pred = pred.detach().cpu().numpy()  # (B, T, 7)
+        pred = pred.detach().float().cpu().numpy()
         pred = self.denormalize_bound(pred, np.array(self.joint_delta_01), np.array(self.joint_delta_99))
         joint = joint.detach().cpu().numpy()  # (B, T, action_num, action_dim)
         joint_future = joint + pred  # (B, T, action_num, action_dim)
@@ -176,7 +177,7 @@ class Dataset_xhand(Dataset):
         with open(data_json_path, "r") as f:
             self.samples = json.load(f)
         self.video_path = [os.path.join(data_root_path, sample['dataset_name']) for sample in self.samples]
-        
+
         print(f"ALL dataset, {len(self.samples)} samples in total")
 
         self.a_min = np.array(args.action_01)[None,:]
@@ -206,7 +207,7 @@ class Dataset_xhand(Dataset):
         frame_ids_ori = np.array((range(start_id, start_id+self.args.num_frames+1)))
         frame_ids_ori = np.clip(frame_ids_ori, 0, max_id) # clip to the max id
         # print(frame_ids, frame_ids_ori)
-        
+
         # load state, action
         self.old_path = '/cephfs/shared/droid_hf/droid_1.0.1'
         file_path = f'{self.old_path}/data/chunk-{chunk_id:03d}/episode_{traj_id:06d}.parquet'
@@ -218,7 +219,7 @@ class Dataset_xhand(Dataset):
             joint_vel = df['action.joint_velocity'][i].tolist()
             joints.append(joint)
             joint_vels.append(joint_vel)
-        
+
         # joints = np.array(joints, dtype=np.float32)
         # joints = self.normalize_bound(joints, self.s_min, self.s_max)
         # joint_vels = np.array(joint_vels, dtype=np.float32)
@@ -336,12 +337,12 @@ if __name__ == "__main__":
 
     #         joint_deltas.append(np.array(joint_delta)[-1:])  # only keep the last frame delta
     #         joint_vel.append(np.array(joint_vels)[-1:])
-    
+
     # joint_deltas = np.concatenate(joint_deltas, axis=0)
     # # 1% and 99% quantile
     # s_min = np.quantile(joint_deltas, 0.01, axis=0, keepdims=True)
     # s_max = np.quantile(joint_deltas, 0.99, axis=0, keepdims=True)
-    
+
     # print("State Max:", s_max)
     # print("State Min:", s_min)
 

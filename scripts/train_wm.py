@@ -43,7 +43,15 @@ def main(args):
         model.load_state_dict(state_dict, strict=True)
     model.to(accelerator.device)
     model.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+
+    # shape_projector + object_state_encoder 파라미터만 학습
+    trainable_params = []
+    if model.shape_projector is not None:
+        trainable_params += list(model.shape_projector.parameters())
+    if model.object_state_encoder is not None:
+        trainable_params += list(model.object_state_encoder.parameters())
+    assert trainable_params, "trainable 파라미터가 없습니다. use_object_state=True 인지 확인하세요."
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
 
     # logs
     if accelerator.is_main_process:
@@ -63,6 +71,14 @@ def main(args):
         print(f"Number of parameters in the text_encoder: {num_params/1000000:.2f}M")
         num_params = sum(p.numel() for p in model.action_encoder.parameters())
         print(f"Number of parameters in the action_encoder: {num_params/1000000:.2f}M")
+        if model.shape_projector is not None:
+            num_params = sum(p.numel() for p in model.shape_projector.parameters())
+            print(f"Number of parameters in the shape_projector: {num_params/1000:.2f}K")
+        if model.object_state_encoder is not None:
+            num_params = sum(p.numel() for p in model.object_state_encoder.parameters())
+            print(f"Number of parameters in the object_state_encoder: {num_params/1000:.2f}K")
+        total_trainable = sum(p.numel() for p in trainable_params)
+        print(f"Total trainable parameters: {total_trainable/1000:.2f}K")
 
     # train and val datasets
     from dataset.dataset_droid_exp33 import Dataset_mix
@@ -174,8 +190,15 @@ def validate_video_generation(model, val_dataset, args, train_steps, videos_dir,
     # start generate
     with torch.no_grad():
         bsz = actions.shape[0]
-        action_latent = model.module.action_encoder(actions, text, model.module.tokenizer, model.module.text_encoder, args.frame_level_cond) if accelerator.num_processes > 1 else model.action_encoder(actions, text, model.tokenizer, model.text_encoder,args.frame_level_cond) # (8, 1, 1024)
+        m = model.module if accelerator.num_processes > 1 else model
+        action_latent = m.action_encoder(actions, text, m.tokenizer, m.text_encoder, args.frame_level_cond) # (B, T, 1024)
         print("action_latent",action_latent.shape)
+
+        # object-state token (validation 시 zeros — obj 정보 없음)
+        from models.object_registry import FEATURE_DIM, MAX_OBJECTS
+        obj_state = torch.zeros(bsz, MAX_OBJECTS, FEATURE_DIM, device=device, dtype=action_latent.dtype)
+        obj_tokens = m.object_state_encoder(obj_state)                   # (B, MAX_OBJECTS, 1024)
+        action_latent = torch.cat([action_latent, obj_tokens], dim=1)  # (B, T+MAX_OBJECTS, 1024)
 
         _, pred_latents = CtrlWorldDiffusionPipeline.__call__(
             pipeline,

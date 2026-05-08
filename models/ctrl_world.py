@@ -2,7 +2,12 @@
 from models.pipeline_stable_video_diffusion import StableVideoDiffusionPipeline
 from models.pipeline_ctrl_world import CtrlWorldDiffusionPipeline
 from models.unet_spatio_temporal_condition import UNetSpatioTemporalConditionModel
+from models.object_registry import FEATURE_DIM, MAX_OBJECTS, SHAPE_SIZE
+from models.warning_utils import WARNING_DIM
 
+OBJ_INJECTION_SCALE = 0.1
+WARNING_INJECTION_SCALE = 0.1
+ #
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,7 +20,7 @@ from tqdm.auto import tqdm
 import json
 from decord import VideoReader, cpu
 import wandb
-import swanlab
+#import swanlab
 import mediapy
 
 
@@ -68,21 +73,21 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
 
-class Action_encoder2(nn.Module):
+class Action_encoder2(nn.Module): # trajetory encoder, encode action sequence to a hidden vector, support text condition
     def __init__(self, action_dim, action_num, hidden_size, text_cond=True):
         super().__init__()
-        self.action_dim = action_dim
-        self.action_num = action_num
-        self.hidden_size = hidden_size
-        self.text_cond = text_cond
+        self.action_dim = action_dim # 액션 차원 (예: 7 = xyz+quat or 6D euler+gripper)
+        self.action_num = action_num # 총 프레임 수 (history + future)
+        self.hidden_size = hidden_size # 출력 차원 (1024)
+        self.text_cond = text_cond # 텍스트 조건 사용 여부
 
         input_dim = int(action_dim)
         self.action_encode = nn.Sequential(
-            nn.Linear(input_dim, 1024),
-            nn.SiLU(),
+            nn.Linear(input_dim, 1024), # action_dim → 1024
+            nn.SiLU(), # Swish 활성화 함수 (부드러운 ReLU)
             nn.Linear(1024, 1024),
             nn.SiLU(),
-            nn.Linear(1024, 1024)
+            nn.Linear(1024, 1024) # 최종 출력: 1024차원
         )
         # kaiming initialization
         nn.init.kaiming_normal_(self.action_encode[0].weight, mode='fan_in', nonlinearity='relu')
@@ -93,21 +98,102 @@ class Action_encoder2(nn.Module):
         B,T,D = action.shape
         if not frame_level_cond:
             action = einops.rearrange(action, 'b t d -> b 1 (t d)')
-        action = self.action_encode(action)
+        action = self.action_encode(action) # MLP 통과 → (B, T, 1024) or (B, 1, 1024)
 
         if texts is not None and self.text_cond:
             # with 50% probability, add text condition
             with torch.no_grad():
                 inputs = text_tokinizer(texts, padding='max_length', return_tensors="pt", truncation=True).to(text_encoder.device)
                 outputs = text_encoder(**inputs)
-                hidden_text = outputs.text_embeds # (B, 512)
-                hidden_text = einops.repeat(hidden_text, 'b c -> b 1 (n c)', n=2) # (B, 1, 1024)
-            
+                hidden_text = outputs.text_embeds # (B, 512) # CLIP text embed: (B, 512)
+                hidden_text = einops.repeat(hidden_text, 'b c -> b 1 (n c)', n=2) # (B, 1, 1024) # (B, 1, 1024) — action과 차원 맞춤
+
             action = action + hidden_text # (B, T, hidden_size)
         return action # (B, 1, hidden_size) or (B, T, hidden_size) if frame_level_cond
 
 
-class CrtlWorld(nn.Module):
+SHAPE_PROJ_DIM = 64   # shape_latent (256) → projected dim before concat with obj_state
+
+
+class WarningEncoder(nn.Module):
+    """
+    warning_vec (B, 8) → (B, 1, 1024) warning token.
+    Linear(8,64) → SiLU → Linear(64,128) → Linear(128,1024).
+    Zero-init on final projection for backward compatibility.
+    """
+    def __init__(self, warning_dim: int = WARNING_DIM, hidden_size: int = 1024):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(warning_dim, 64),
+            nn.SiLU(),
+            nn.Linear(64, 128),
+        )
+        self.proj = nn.Linear(128, hidden_size)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, warning_vec: torch.Tensor) -> torch.Tensor:
+        """warning_vec: (B, 8) → (B, 1, 1024)"""
+        return self.proj(self.encoder(warning_vec)).unsqueeze(1)
+
+
+class ShapeProjector(nn.Module):
+    """
+    shape_latent (B, MAX_OBJECTS, SHAPE_SIZE^2) → (B, MAX_OBJECTS, SHAPE_PROJ_DIM).
+    경량 MLP — ObjectStateEncoder 입력 전 shape 정보를 압축.
+    """
+    def __init__(self, shape_dim: int = SHAPE_SIZE * SHAPE_SIZE, proj_dim: int = SHAPE_PROJ_DIM):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(shape_dim, 128),
+            nn.SiLU(),
+            nn.Linear(128, proj_dim),
+        )
+
+    def forward(self, obj_shape: torch.Tensor) -> torch.Tensor:
+        """obj_shape: (B, MAX_OBJECTS, SHAPE_SIZE^2) → (B, MAX_OBJECTS, SHAPE_PROJ_DIM)"""
+        return self.proj(obj_shape)
+
+
+class ObjectStateEncoder(nn.Module):
+    """
+    [obj_state ‖ obj_shape_proj] → (B, MAX_OBJECTS, 1024) token sequence.
+
+    입력:  (B, MAX_OBJECTS, FEATURE_DIM + SHAPE_PROJ_DIM)
+    출력:  (B, MAX_OBJECTS, hidden_size)
+
+    학습 전략 (classifier-free guidance 방식):
+      - training 중 obj_dropout_prob 확률로 전체 token을 zeros로 치환
+        → 모델이 object token 없이도 동작하도록 학습 (기존 ckpt 호환)
+      - inference 시 실제 object state를 주입하면 conditioning 효과 발생
+    """
+    def __init__(self, feature_dim: int = FEATURE_DIM + SHAPE_PROJ_DIM,
+                 hidden_size: int = 1024, obj_dropout_prob: float = 0.5):
+        super().__init__()
+        self.obj_dropout_prob = obj_dropout_prob
+        self.encoder = nn.Sequential(
+            nn.Linear(feature_dim, 1024),
+            nn.SiLU(),
+            nn.Linear(1024, 1024),
+            nn.SiLU(),
+            nn.Linear(1024, hidden_size),
+        )
+        # zero init → 학습 초반에 기존 action token에 영향 최소화
+        nn.init.zeros_(self.encoder[-1].weight)
+        nn.init.zeros_(self.encoder[-1].bias)
+
+    def forward(self, obj_feat: torch.Tensor) -> torch.Tensor:
+        """
+        obj_feat: (B, MAX_OBJECTS, FEATURE_DIM + SHAPE_PROJ_DIM) float
+        returns:  (B, MAX_OBJECTS, 1024)
+        """
+        result = self.encoder(obj_feat)  # 항상 계산 — grad_fn 유지
+        if self.training and torch.rand(1).item() < self.obj_dropout_prob:
+            return result * 0.0  # zeros이지만 grad_fn 살아있음 (CFG dropout)
+        return result
+
+
+class CrtlWorld(nn.Module): # main model class, input action sequence and text, output future frame latent prediction, support frame_level pose condition
     def __init__(self, args):
         super(CrtlWorld, self).__init__()
 
@@ -120,16 +206,16 @@ class CrtlWorld(nn.Module):
         unet = UNetSpatioTemporalConditionModel()
         unet.load_state_dict(self.pipeline.unet.state_dict(), strict=False)
         self.pipeline.unet = unet
-        
+
         self.unet = self.pipeline.unet
         self.vae = self.pipeline.vae
         self.image_encoder = self.pipeline.image_encoder
         self.scheduler = self.pipeline.scheduler
 
-        # freeze vae, image_encoder, enable unet gradient ckpt
+        # freeze all backbone — only shape_projector / object_state_encoder are trainable
         self.vae.requires_grad_(False)
         self.image_encoder.requires_grad_(False)
-        self.unet.requires_grad_(True)
+        self.unet.requires_grad_(False)
         self.unet.enable_gradient_checkpointing()
 
         # SVD is a img2video model, load a clip text encoder
@@ -140,8 +226,31 @@ class CrtlWorld(nn.Module):
 
         # initialize an action projector
         self.action_encoder = Action_encoder2(action_dim=args.action_dim, action_num=int(args.num_history+args.num_frames), hidden_size=1024, text_cond=args.text_cond)
+        self.action_encoder.requires_grad_(False)
 
-    
+        self.use_object_state = getattr(args, 'use_object_state', False)
+
+        if self.use_object_state:
+            self.shape_projector = ShapeProjector(
+                shape_dim=SHAPE_SIZE * SHAPE_SIZE,
+                proj_dim=SHAPE_PROJ_DIM,
+            )
+            self.object_state_encoder = ObjectStateEncoder(
+                feature_dim=FEATURE_DIM + SHAPE_PROJ_DIM,
+                hidden_size=1024,
+                obj_dropout_prob=getattr(args, 'obj_dropout_prob', 0.5),
+            )
+        else:
+            self.shape_projector       = None
+            self.object_state_encoder  = None
+
+        self.use_warning = getattr(args, 'use_warning', False)
+        if self.use_warning:
+            self.warning_encoder = WarningEncoder(warning_dim=WARNING_DIM, hidden_size=1024)
+        else:
+            self.warning_encoder = None
+
+
 
     def forward(self, batch):
         latents = batch['latent'] # (B, 16, 4, 32, 32)
@@ -177,6 +286,23 @@ class CrtlWorld(nn.Module):
         text_mask = (torch.rand(action_hidden.shape[0], device=device)>0.05).unsqueeze(1).unsqueeze(2)
         action_hidden = action_hidden*text_mask+uncond_hidden_states*(~text_mask)
 
+        # object-state + shape token conditioning
+        if self.object_state_encoder is not None:
+            obj_state = (batch['obj_state'].to(device).to(dtype)
+                         if 'obj_state' in batch and batch['obj_state'] is not None
+                         else torch.zeros(bsz, MAX_OBJECTS, FEATURE_DIM, device=device, dtype=dtype))
+            obj_shape = (batch['obj_shape'].to(device).to(dtype)
+                         if 'obj_shape' in batch and batch['obj_shape'] is not None
+                         else torch.zeros(bsz, MAX_OBJECTS, SHAPE_SIZE * SHAPE_SIZE, device=device, dtype=dtype))
+            obj_shape_proj = self.shape_projector(obj_shape)           # (B, MAX_OBJECTS, SHAPE_PROJ_DIM)
+            obj_feat       = torch.cat([obj_state, obj_shape_proj], dim=-1)  # (B, MAX_OBJECTS, FEATURE_DIM+SHAPE_PROJ_DIM)
+            obj_tokens    = self.object_state_encoder(obj_feat)        # (B, MAX_OBJECTS, 1024)
+            # residual injection: 시퀀스 길이 유지
+            n_obj = min(obj_tokens.shape[1], action_hidden.shape[1])
+            action_hidden = action_hidden.clone()
+            _obj_scale_inj = getattr(self.args, 'obj_injection_scale', OBJ_INJECTION_SCALE)
+            action_hidden[:, :n_obj] = action_hidden[:, :n_obj] + _obj_scale_inj * obj_tokens[:, :n_obj]
+
         # diffusion forward process on future latent
         rnd_normal = torch.randn([bsz, 1, 1, 1, 1], device=device)
         sigma = (rnd_normal * P_std + P_mean).exp()
@@ -200,10 +326,20 @@ class CrtlWorld(nn.Module):
         added_time_ids = self.pipeline._get_add_time_ids(fps, motion_bucket_id, noise_aug_strength, action_hidden.dtype, bsz, 1, False)
         added_time_ids = added_time_ids.to(device)
 
+        # warning token conditioning
+        if self.warning_encoder is not None:
+            warning_vec = (batch['warning_vec'].to(device).to(dtype)
+                           if 'warning_vec' in batch and batch['warning_vec'] is not None
+                           else torch.zeros(bsz, WARNING_DIM, device=device, dtype=dtype))
+            warning_token = self.warning_encoder(warning_vec)     # (B, 1, 1024)
+            action_hidden = action_hidden.clone()
+            _warn_scale_inj = getattr(self.args, 'warning_injection_scale', WARNING_INJECTION_SCALE)
+            action_hidden[:, :1] = action_hidden[:, :1] + _warn_scale_inj * warning_token  # 첫 토큰에 residual
+
         # forward unet
         loss = 0
         model_pred = self.unet(input_latents, c_noise, encoder_hidden_states=action_hidden, added_time_ids=added_time_ids,frame_level_cond=self.args.frame_level_cond).sample
-        predict_x0 = c_out * model_pred + c_skip * noisy_latents 
+        predict_x0 = c_out * model_pred + c_skip * noisy_latents
 
         # only calculate loss on future frames
         loss += ((predict_x0[:,num_history:] - latents[:,num_history:])**2 * loss_weight).mean()

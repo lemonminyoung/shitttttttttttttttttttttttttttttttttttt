@@ -13,3 +13,12 @@ dataset_example/droid_subset/annotation/val_old*
 dataset_example/droid_new_setup_eval*
 .vscode
 process.py
+checkpoints/
+synthetic_traj/
+eval_results/
+debug_gripper_scale/
+debug_vae_latent_deform/
+*.jpg
+*.png
+*.pt
+*.npy

@@ -193,8 +193,200 @@ class Dataset_mix(Dataset):
         action = self.normalize_bound(action, state_p01, state_p99)
         data['action'] = torch.tensor(action).float()
 
+        # object condition fields: context frames only (history + current), N=3 fixed
+        # All zeros because real training data has no SAM3 annotations.
+        # presence=0 means absent slot → ObjectStateEncoder will use null_object token.
+        N_OBJ   = 3
+        F_ctx   = self.args.num_history + 1   # history frames + current frame
+        CROP_SZ = 16
+        data['object_presence']  = torch.zeros(F_ctx, N_OBJ, 1,            dtype=torch.float32)
+        data['object_bbox']      = torch.zeros(F_ctx, N_OBJ, 4,            dtype=torch.float32)
+        data['object_state']     = torch.zeros(F_ctx, N_OBJ, 1,            dtype=torch.float32)
+        data['object_mask_crop'] = torch.zeros(F_ctx, N_OBJ, CROP_SZ, CROP_SZ, dtype=torch.float32)
+
         return data
-        
+
+
+# ── TrackingDataset ────────────────────────────────────────────────────────────
+
+def _safe_float(v, default=0.0):
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_list(v):
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        import ast
+        try:
+            return ast.literal_eval(v)
+        except Exception:
+            return []
+    return []
+
+
+class TrackingDataset(Dataset):
+    """
+    SAM3 tracking annotation이 있는 에피소드를 phase1 학습 포맷으로 로드.
+
+    tracking_root/
+      <episode>/
+        latent.pt       (T, 4, 24, 40)  ← single-view VAE latent
+        tracking.json   ← per-frame action + object fields
+
+    출력 포맷은 Dataset_mix와 동일:
+      latent           (H+F, 4, 72, 40)  — single view를 3-view 슬롯에 repeat
+      action           (H+F, 7)          — stat.json 동일 bounds로 정규화
+      text             str
+      object_presence  (F_ctx, N_OBJ, 1)
+      object_bbox      (F_ctx, N_OBJ, 4)
+      object_state     (F_ctx, N_OBJ, 1)
+      object_mask_crop (F_ctx, N_OBJ, 16, 16)
+    """
+
+    N_OBJ   = 3
+    CROP_SZ = 16
+
+    def __init__(self, tracking_root: str, args, stat_path: str = None):
+        super().__init__()
+        self.args          = args
+        self.num_history   = args.num_history   # 6
+        self.num_frames    = args.num_frames     # 5
+        self.win           = self.num_history + self.num_frames  # 11
+        self.f_ctx         = self.num_history + 1                # 7
+
+        # 정규화 bounds — Dataset_mix와 동일한 stat.json 사용
+        if stat_path is None:
+            stat_path = os.path.join(
+                args.dataset_meta_info_path,
+                args.dataset_cfgs.split('+')[0],
+                'stat.json',
+            )
+        with open(stat_path) as f:
+            stat = json.load(f)
+        self.state_p01 = np.array(stat['state_01'], dtype=np.float32)[None, :]  # (1, 7)
+        self.state_p99 = np.array(stat['state_99'], dtype=np.float32)[None, :]  # (1, 7)
+
+        self.samples = []   # list of (ep_dir, start_idx, meta_dict)
+        self._load_episodes(tracking_root)
+        print(f"[TrackingDataset] {len(self.samples)} samples from {tracking_root}")
+
+    def _load_episodes(self, tracking_root: str):
+        for ep_name in sorted(os.listdir(tracking_root)):
+            ep_dir      = os.path.join(tracking_root, ep_name)
+            track_path  = os.path.join(ep_dir, 'tracking.json')
+            latent_path = os.path.join(ep_dir, 'latent.pt')
+            if not (os.path.isfile(track_path) and os.path.isfile(latent_path)):
+                continue
+            with open(track_path) as f:
+                meta = json.load(f)
+            frames = meta.get('frames', [])
+            if len(frames) < self.win:
+                continue
+            # action이 없는 프레임이 있으면 건너뜀
+            if any(f.get('action') is None for f in frames):
+                print(f"  [SKIP] {ep_name}: action missing in some frames")
+                continue
+            for start in range(len(frames) - self.win + 1):
+                self.samples.append((ep_dir, start, meta))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _normalize(self, action: np.ndarray) -> np.ndarray:
+        ndata = 2.0 * (action - self.state_p01) / (self.state_p99 - self.state_p01 + 1e-8) - 1.0
+        return np.clip(ndata, -1.0, 1.0)
+
+    def _extract_object_fields(self, frames_slice: list, object_labels: list):
+        """
+        F_ctx 프레임 × N_OBJ 슬롯 object 텐서 생성.
+        슬롯 순서: object_labels 순서, 남은 슬롯은 absence(zeros).
+        """
+        F = len(frames_slice)
+        N = self.N_OBJ
+        C = self.CROP_SZ
+
+        presence  = np.zeros((F, N, 1),    dtype=np.float32)
+        bbox      = np.zeros((F, N, 4),    dtype=np.float32)
+        state_arr = np.zeros((F, N, 1),    dtype=np.float32)
+        mask_crop = np.zeros((F, N, C, C), dtype=np.float32)
+
+        for fi, frame in enumerate(frames_slice):
+            for si, lbl in enumerate(object_labels[:N]):
+                obj = frame['objects'].get(lbl, {})
+                if not obj:
+                    continue
+                pres = _safe_float(obj.get('presence', 0.0))
+                presence[fi, si, 0] = pres
+
+                if pres > 0.5:
+                    bb = _safe_list(obj.get('bbox', []))
+                    if len(bb) == 4:
+                        bbox[fi, si] = [float(x) for x in bb]
+
+                    st = _safe_float(obj.get('state', 0.0))
+                    state_arr[fi, si, 0] = st
+
+                    mk = _safe_list(obj.get('mask_crop_16', []))
+                    if len(mk) == C:
+                        for r in range(C):
+                            row = _safe_list(mk[r]) if not isinstance(mk[r], list) else mk[r]
+                            if len(row) == C:
+                                mask_crop[fi, si, r] = [float(x) for x in row]
+
+        return (
+            torch.tensor(presence),
+            torch.tensor(bbox),
+            torch.tensor(state_arr),
+            torch.tensor(mask_crop),
+        )
+
+    def __getitem__(self, idx):
+        ep_dir, start, meta = self.samples[idx]
+        frames = meta['frames']
+        win_frames  = frames[start: start + self.win]
+        ctx_frames  = win_frames[: self.f_ctx]
+
+        # ── latent ───────────────────────────────────────────────────────────
+        latent_full = torch.load(os.path.join(ep_dir, 'latent.pt'),
+                                 map_location='cpu').float()   # (T, 4, 24, 40)
+        latent_win  = latent_full[start: start + self.win]    # (win, 4, 24, 40)
+
+        # single view → 3-view 슬롯에 repeat (각 24행씩 채움)
+        latent = torch.zeros(self.win, 4, 72, 40, dtype=torch.float32)
+        latent[:, :,  0:24, :] = latent_win
+        latent[:, :, 24:48, :] = latent_win
+        latent[:, :, 48:72, :] = latent_win
+
+        # ── action ───────────────────────────────────────────────────────────
+        actions = np.array([f['action'] for f in win_frames], dtype=np.float32)  # (win, 7)
+        actions = self._normalize(actions)
+        action  = torch.tensor(actions)
+
+        # ── text ─────────────────────────────────────────────────────────────
+        text = meta.get('language_instruction', '')
+
+        # ── object fields (context frames only) ──────────────────────────────
+        object_labels = meta.get('object_labels', list(ctx_frames[0]['objects'].keys()))
+        presence, bbox, state_t, mask_crop = self._extract_object_fields(
+            ctx_frames, object_labels
+        )
+
+        return {
+            'latent':           latent,
+            'action':           action.float(),
+            'text':             text,
+            'object_presence':  presence,
+            'object_bbox':      bbox,
+            'object_state':     state_t,
+            'object_mask_crop': mask_crop,
+        }
+
 
 if __name__ == "__main__":
 

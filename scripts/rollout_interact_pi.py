@@ -2,10 +2,8 @@
 from openpi.training import config as config_pi
 from openpi.policies import policy_config
 from openpi_client import image_tools
-# from openpi.shared import download
 
 import numpy as np
-
 
 from accelerate import Accelerator
 import torch
@@ -24,7 +22,7 @@ from tqdm.auto import tqdm
 import wandb
 import json
 from decord import VideoReader, cpu
-import swanlab
+#import swanlab
 import mediapy
 import sys
 from scipy.spatial.transform import Rotation as R
@@ -34,11 +32,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.pipeline_ctrl_world import CtrlWorldDiffusionPipeline
 from models.ctrl_world import CrtlWorld
 from models.utils import key_board_control, get_fk_solution
-    
+
 
 class agent():
     def __init__(self,args):
-          
+
         # args = Args()
         args.val_model_path = args.ckpt_path
         self.args = args
@@ -49,7 +47,7 @@ class agent():
         # load pi policy
         if 'pi05' in args.policy_type:
             config = config_pi.get_config("pi05_droid")
-            # checkpoint_dir = '/cephfs/shared/llm/openpi/openpi-assets-preview/checkpoints/pi05_droid' 
+            # checkpoint_dir = '/cephfs/shared/llm/openpi/openpi-assets-preview/checkpoints/pi05_droid'
         elif 'pi0fast' in args.policy_type:
             config = config_pi.get_config("pi0fast_droid")
             # checkpoint_dir = '/cephfs/shared/llm/openpi/openpi-assets/checkpoints/pi0fast_droid'
@@ -71,12 +69,12 @@ class agent():
             data_stat = json.load(f)
             self.state_p01 = np.array(data_stat['state_01'])[None,:]
             self.state_p99 = np.array(data_stat['state_99'])[None,:]
-        
-        # Since the official Pi-Droid model output joint velocity, and crtl-world is train on cartesian space, we need to load an light-weight adapter to transform joint velocity action into cartesian pose action. 
+
+        # Since the official Pi-Droid model output joint velocity, and crtl-world is train on cartesian space, we need to load an light-weight adapter to transform joint velocity action into cartesian pose action.
         if args.action_adapter is not None:
             from models.action_adapter.train2 import Dynamics
             self.dynamics_model = Dynamics(action_dim=7, action_num=15, hidden_size=512).to(self.device)
-            self.dynamics_model.load_state_dict(torch.load(args.action_adapter, map_location=self.device))        
+            self.dynamics_model.load_state_dict(torch.load(args.action_adapter, map_location=self.device))
 
     def normalize_bound(
         self,
@@ -94,7 +92,8 @@ class agent():
     def get_traj_info(self, id, start_idx=0, steps=8,skip=1):
         val_dataset_dir = self.args.val_dataset_dir
         num_frames = steps
-        annotation_path = f"{val_dataset_dir}/annotation/val/{id}.json"
+        annotation_path = f"{val_dataset_dir}/annotation/val/{'0004'}.json"
+        #annotation_path = "/home/dgu/minyoung/Ctrl-World/dataset_example/droid_subset/annotation/val/18599.json"
         with open(annotation_path) as f:
             anno = json.load(f)
             try:
@@ -116,9 +115,12 @@ class agent():
         # get videos
         video_dict =[]
         video_latent = []
+        length_temp = anno["videos"]
+        print("!!!!!!!!!!!!!![length_temp]!!!!!!!!!!!!!", length_temp)
         for id in range(len(anno['videos'])):
-            video_path = anno['videos'][id]['video_path']
-            video_path = f"{val_dataset_dir}/{video_path}"
+           # video_path = anno['videos'][id]['video_path']
+            video_path = f"{val_dataset_dir}/videos/val/{'0004'}/{id}.mp4"
+            #video_path = f"/home/dgu/minyoung/Ctrl-World/dataset_example/droid_subset/videos/val/18599/{id}.mp4"
             # load videos from all views
             vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
             try:
@@ -141,10 +143,10 @@ class agent():
                     latent = vae.encode(batch).latent_dist.sample().mul_(vae.config.scaling_factor)
                     latents.append(latent)
                 x = torch.cat(latents, dim=0)
-    
+
             video_latent.append(x)
 
-        
+
         return car_action, joint_pos, video_dict, video_latent, instruction
 
     def forward_wm(self, action_cond, video_latent_true, video_latent_cond, his_cond=None, text=None):
@@ -165,9 +167,9 @@ class agent():
             if text is not None:
                 text_token = self.model.action_encoder(action_cond, text, self.model.tokenizer, self.model.text_encoder)
             else:
-                text_token = self.model.action_encoder(action_cond)           
+                text_token = self.model.action_encoder(action_cond)
             pipeline = self.model.pipeline
-            
+
             _, latents = CtrlWorldDiffusionPipeline.__call__(
                 pipeline,
                 image=image_cond,
@@ -220,12 +222,12 @@ class agent():
 
         # concatenate true videos and video
         videos_cat = np.concatenate([true_video,videos],axis=-3) # (3, 8, 256, 256, 3)
-        videos_cat = np.concatenate([video for video in videos_cat],axis=-2).astype(np.uint8) 
+        videos_cat = np.concatenate([video for video in videos_cat],axis=-2).astype(np.uint8)
 
         return videos_cat, true_video, videos, latents  # np.uint8:(3, 8, 128, 256, 3) or (3, 8, 192, 320, 3)
 
     def forward_policy(self, videos, state, joints, text, time_step=1):
-        
+
         # inference policy
         image1 = videos[1]
         image2 = videos[2]
@@ -271,7 +273,7 @@ class agent():
             xyz = current_state_fk[:3, 3]
             rotation_matrix = current_state_fk[:3, :3]
             r = R.from_matrix(rotation_matrix)
-            euler = r.as_euler('xyz') 
+            euler = r.as_euler('xyz')
             state_fk.append(np.concatenate([xyz, euler, gripper_pos[i]], axis=0))
         state_fk = np.array(state_fk) # (15,7)
 
@@ -289,7 +291,7 @@ class agent():
 
         return policy_in_out, joint_pos_skip, state_fk_skip
 
-    
+
 if __name__ == "__main__":
     from config import wm_args
     from argparse import ArgumentParser
@@ -330,6 +332,13 @@ if __name__ == "__main__":
         eef_gt, joint_pos_gt, video_dict, video_latents,_ = Agent.get_traj_info(val_id_i, start_idx=start_idx_i, steps=int(pred_step*interact_num+8))
         print("text_i:",text_i, "eef pose at t=0", eef_gt[0], "joint at t=0", joint_pos_gt[0])
 
+        # 여기에 추가할 것:
+        # 1. 첫 프레임 추출 (video_dict[view_id][0])
+        # 2. Qwen3-VL or 수동으로 object_labels 정의
+        # 3. SAM3Manager.initialize(first_frame, object_labels)
+        # 4. ObjectRegistry 초기화
+        # 5. initial_appearances 저장 (CLIP)
+
         # initialize all history buffer
         video_to_save, info_to_save = [], []
         his_cond, his_joint, his_eef = [], [], []
@@ -349,12 +358,20 @@ if __name__ == "__main__":
             start_id = int(i*(pred_step-1))
             end_id = start_id + pred_step
             video_latent_true = [v[start_id:end_id] for v in video_latents]
-            
+
+            # ← 여기에 SAM3 tracking 블록 추가
+            # online.py의 "생성된 각 프레임에 대해" 부분 (t loop)
+            # - video_dict_pred에서 프레임 추출
+            # - SAM3Manager.update_chunk(chunk)
+            # - update_registry()로 interaction/absence 판별
+            # - step_log 기록
+            # - neg_event_detected 체크
+
             print("################ policy forward ####################")
             # prepare input for policy
             current_joint = his_joint[-1][0] # (1, 8)
             current_pose = his_eef[-1][0] # (1, 8)
-            current_obs = [v[-1] for v in video_dict_pred] 
+            current_obs = [v[-1] for v in video_dict_pred]
             # forward policy
             policy_in_out, joint_pos, cartesian_pose= Agent.forward_policy(current_obs, current_pose, current_joint, text=text_i)
             print("cartesian space action", cartesian_pose[0]) # output xyz and gripper for debug
@@ -371,7 +388,7 @@ if __name__ == "__main__":
             current_latent = his_cond[-1]  # (1, 4, 72, 40)
             # forward world model
             videos_cat, true_videos, video_dict_pred, predict_latents = Agent.forward_wm(action_cond, video_latent_true, current_latent, his_cond=his_latent,text=text_i if Agent.args.text_cond else None)
-            
+
             print("################ record information ################")
             # push current step to history buffer
             his_joint.append(joint_pos[pred_step-1][None,:])  # (1, 8)
@@ -379,7 +396,7 @@ if __name__ == "__main__":
             his_cond.append(torch.cat([v[pred_step-1] for v in predict_latents], dim=1).unsqueeze(0))  # (1, 4, 72, 40)
             video_to_save.append(videos_cat[:pred_step-1])
             info_to_save.append(policy_in_out)  # save policy output info
-            
+
 
         # save rollout video and info with parameters
         print("##########################################################################")
@@ -405,5 +422,5 @@ if __name__ == "__main__":
 
 
 # CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 python rollout_interact_pi.py --task_type pickplace
-        
-        
+
+

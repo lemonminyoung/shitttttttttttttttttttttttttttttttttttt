@@ -54,6 +54,7 @@ class LatentToVideoPipeline(TextToVideoSDPipeline):
         mask=None,
         timesteps=None,
         motion=None,
+        object_hidden_states=None # CFG 때 cat([ohs]*2)를 바꿔야 해.
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -178,7 +179,7 @@ class LatentToVideoPipeline(TextToVideoSDPipeline):
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         uncondition_latent = condition_latent
-        condition_latent = torch.cat([uncondition_latent, condition_latent]) if do_classifier_free_guidance else condition_latent 
+        condition_latent = torch.cat([uncondition_latent, condition_latent]) if do_classifier_free_guidance else condition_latent
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
@@ -244,11 +245,11 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        image,
-        text,
+        image, # 현재 프레임: PIL or Tensor(B,3,H,W) or 이미 latent(B,4,H,W)
+        text,  #← 이름이 text지만 실제로는 action_encoder 출력 (B, T, 1024)
         height: int = 576,
         width: int = 1024,
-        num_frames: Optional[int] = None,
+        num_frames: Optional[int] = None, # 생성할 미래 프레임 수
         num_inference_steps: int = 25,
         min_guidance_scale: float = 1.0,
         max_guidance_scale: float = 3.0,
@@ -265,9 +266,12 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
         return_dict: bool = True,
         mask = None,
         cond_wrist=None,
-        history=None,
+        history=None, # 과거 프레임 latents: (B, num_his, 4, H, W)
         frame_level_cond=False,
         his_cond_zero=False,
+        warning_text=None,              # warning-conditioned tokens (B, T, 1024)
+        warning_guidance_scale: float = 1.0,  # α: noise_pred += α*(pred_uncond - pred_warn)
+        object_hidden_states=None,      # Phase1 adapter: (B, H+F, N, 1024) | None
     ):
         r"""
         The call function to the pipeline for generation.
@@ -352,7 +356,7 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
         num_frames = num_frames if num_frames is not None else self.unet.config.num_frames
         decode_chunk_size = decode_chunk_size if decode_chunk_size is not None else num_frames
         # device = self._execution_device
-        device = self.unet.device   
+        device = self.unet.device
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
@@ -377,7 +381,7 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
         if do_classifier_free_guidance:
             negative_image_embeddings = torch.zeros_like(image_embeddings)
             image_embeddings = torch.cat([negative_image_embeddings, image_embeddings])
-        
+
 
         # NOTE: Stable Diffusion Video was conditioned on fps - 1, which
         # is why it is reduced here.
@@ -465,10 +469,17 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
             B,F, C, H, W = latents.shape
             cond_wrist = einops.repeat(cond_wrist, 'b l c h w -> b (f l) (n c) h w', n=3,f=num_frames) # (B, 8, 12 , 24, 40)
             cond_wrist = torch.cat([cond_wrist]*2) if do_classifier_free_guidance else cond_wrist
-        
+
         if history is not None:
             history = torch.cat([history] * 2) if do_classifier_free_guidance else history
-        
+
+        # Phase1 adapter: 2B CFG doubling
+        # uncond half → zeros (object-free direction)
+        # cond  half  → actual object tokens (object-conditioned direction)
+        if object_hidden_states is not None and do_classifier_free_guidance:
+            zeros_ohs = torch.zeros_like(object_hidden_states)
+            object_hidden_states = torch.cat([zeros_ohs, object_hidden_states])
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
@@ -484,7 +495,7 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
                 if cond_wrist is not None and i==0:
                     # print('cond_wrist_shape:',cond_wrist.shape, 'latent_model_input_shape:',latent_model_input.shape)
                     latent_model_input = torch.cat([latent_model_input, cond_wrist], dim=3) # (B, 8, 12, 96, 40)
-                
+
 
                 # predict the noise residual
                 latent_model_input = latent_model_input.to(self.unet.dtype)
@@ -500,6 +511,7 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
                     added_time_ids=added_time_ids,
                     return_dict=False,
                     frame_level_cond=frame_level_cond,
+                    object_hidden_states=object_hidden_states,
                 )[0]
 
                 if cond_wrist is not None:
@@ -510,9 +522,31 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
                     noise_pred = noise_pred[:, num_his:, :, :, :] # remove history
 
                 # perform guidance
+                noise_pred_uncond = None
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+                # CFG-style Negative Warning Guidance
+                # steer AWAY from warning-conditioned direction:
+                #   noise_pred += α * (pred_uncond - pred_warn)
+                if warning_text is not None and warning_guidance_scale != 0.0:
+                    _uncond = noise_pred_uncond if noise_pred_uncond is not None else noise_pred
+                    lmi_warn = self.scheduler.scale_model_input(latents, t)
+                    if history is not None:
+                        lmi_warn = torch.cat([history[:batch_size], lmi_warn], dim=1)
+                    lmi_warn = torch.cat([lmi_warn, image_latents[:batch_size]], dim=2)
+                    lmi_warn = lmi_warn.to(self.unet.dtype)
+                    noise_pred_warn = self.unet(
+                        lmi_warn, t,
+                        encoder_hidden_states=warning_text.to(self.unet.dtype),
+                        added_time_ids=added_time_ids[:batch_size],
+                        return_dict=False,
+                        frame_level_cond=frame_level_cond,
+                    )[0]
+                    if history is not None:
+                        noise_pred_warn = noise_pred_warn[:, num_his:, :, :, :]
+                    noise_pred = noise_pred + warning_guidance_scale * (_uncond - noise_pred_warn)
 
                 # model_output = noise_pred
                 # # sigma = self.scheduler.get_sigma(t)
@@ -558,8 +592,8 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
             return frames,latents
 
         return StableVideoDiffusionPipelineOutput(frames=frames)
-        
-class TextStableVideoDiffusionPipeline(StableVideoDiffusionPipeline):
+
+class TextStableVideoDiffusionPipeline(StableVideoDiffusionPipeline): # for text-to-video generation, where the conditioning is only on text, no image conditioning
     @torch.no_grad()
     def __call__(
         self,
@@ -700,7 +734,7 @@ class TextStableVideoDiffusionPipeline(StableVideoDiffusionPipeline):
             image_embeddings = torch.cat([image_embeddings, prompt_embeds], dim=1)
         motion_mask = self.unet.config.in_channels == 9
         if do_classifier_free_guidance:
-            mask = torch.cat([mask]*2) 
+            mask = torch.cat([mask]*2)
         # NOTE: Stable Diffusion Video was conditioned on fps - 1, which
         # is why it is reduced here.
         # See: https://github.com/Stability-AI/generative-models/blob/ed0997173f98eaf8f4edf7ba5fe8f15c6b877fd3/scripts/sampling/simple_video_sample.py#L188
@@ -724,7 +758,7 @@ class TextStableVideoDiffusionPipeline(StableVideoDiffusionPipeline):
             condition_latent = image_latents.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
         else:
             if do_classifier_free_guidance:
-                condition_latent = torch.cat([condition_latent] * 2) 
+                condition_latent = torch.cat([condition_latent] * 2)
         # 5. Get Added Time IDs
 
         # cast back to fp16 if needed

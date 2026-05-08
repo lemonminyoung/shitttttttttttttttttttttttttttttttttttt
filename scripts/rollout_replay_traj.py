@@ -15,6 +15,9 @@ from models.pipeline_ctrl_world import CtrlWorldDiffusionPipeline
 from models.ctrl_world import CrtlWorld
 from models.utils import key_board_control, get_fk_solution
 
+# rollout_replay_traj.py 상단 import에 추가
+#from sam3_manager import SAM3Manager
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -37,7 +40,7 @@ from scipy.spatial.transform import Rotation as R
 
 class agent():
     def __init__(self,args):
-          
+
         # args = Args()
         args.val_model_path = args.ckpt_path
         self.args = args
@@ -48,7 +51,7 @@ class agent():
         # # load pi policy
         # if 'pi05' in args.policy_type:
         #     config = config_pi.get_config("pi05_droid")
-        #     checkpoint_dir = '/cephfs/shared/llm/openpi/openpi-assets-preview/checkpoints/pi05_droid' 
+        #     checkpoint_dir = '/cephfs/shared/llm/openpi/openpi-assets-preview/checkpoints/pi05_droid'
         # elif 'pi0fast' in args.policy_type:
         #     config = config_pi.get_config("pi0fast_droid")
         #     checkpoint_dir = '/cephfs/shared/llm/openpi/openpi-assets/checkpoints/pi0fast_droid'
@@ -59,17 +62,19 @@ class agent():
         #     raise ValueError(f"Unknown policy type: {args.policy_type}")
         # self.policy = policy_config.create_trained_policy(config, checkpoint_dir)
 
-        # load ctrl-world model        
+        # load ctrl-world model
         self.model = CrtlWorld(args)
         self.model.load_state_dict(torch.load(args.val_model_path))
         self.model.to(self.accelerator.device).to(self.dtype)
         self.model.eval()
+
+        self.sam3 = SAM3Manager(checkpoint_path="/home/dgu/minyoung/sam3/checkpoints/sam3.pt")
         print("load world model success")
         with open(f"{args.data_stat_path}", 'r') as f:
             data_stat = json.load(f)
             self.state_p01 = np.array(data_stat['state_01'])[None,:]
             self.state_p99 = np.array(data_stat['state_99'])[None,:]
-        
+
 
     def normalize_bound(
         self,
@@ -135,10 +140,10 @@ class agent():
                     latent = vae.encode(batch).latent_dist.sample().mul_(vae.config.scaling_factor)
                     latents.append(latent)
                 x = torch.cat(latents, dim=0)
-    
+
             video_latent.append(x)
 
-        
+
         return car_action, joint_pos, video_dict, video_latent, instruction
 
     def forward_wm(self, action_cond, video_latent_true, video_latent_cond, his_cond=None, text=None):
@@ -158,9 +163,9 @@ class agent():
             if text is not None:
                 text_token = self.model.action_encoder(action_cond, text, self.model.tokenizer, self.model.text_encoder)
             else:
-                text_token = self.model.action_encoder(action_cond)           
+                text_token = self.model.action_encoder(action_cond)
             pipeline = self.model.pipeline
-            
+
             _, latents = CtrlWorldDiffusionPipeline.__call__(
                 pipeline,
                 image=image_cond,
@@ -213,11 +218,11 @@ class agent():
 
         # concatenate true videos and video
         videos_cat = np.concatenate([true_video,videos],axis=-3) # (3, 8, 256, 256, 3)
-        videos_cat = np.concatenate([video for video in videos_cat],axis=-2).astype(np.uint8) 
+        videos_cat = np.concatenate([video for video in videos_cat],axis=-2).astype(np.uint8)
 
         return videos_cat, true_video, videos, latents  # np.uint8:(3, 8, 128, 256, 3) or (3, 8, 192, 320, 3)
 
-        
+
 if __name__ == "__main__":
     from config import wm_args
     from argparse import ArgumentParser
@@ -238,7 +243,7 @@ if __name__ == "__main__":
             if v is not None:
                 args.__dict__[k] = v
         return args
-    
+
     args = merge_args(args, args_new)
 
     # create rollout agent
@@ -270,13 +275,19 @@ if __name__ == "__main__":
             his_joint.append(joint_pos_gt[0:1])  # (1, 7)
             his_eef.append(eef_gt[0:1])  # (1, 7)
 
+        # ── SAM3 초기화 (루프 시작 전) ────────────────────────
+        first_frame = video_dict[0][0]  # (H, W, 3) uint8, 첫 번째 뷰 첫 프레임
+        object_names = ["robot arm", "target object"]  # ← 태스크에 맞게 수정
+        Agent.sam3.initialize(first_frame, object_names)
+        # ────────────────────────────────────────────────────
+
         # interact loop
         for i in range(interact_num):
             # ground truth video
             start_id = int(i*(pred_step-1))
             end_id = start_id + pred_step
             video_latent_true = [v[start_id:end_id] for v in video_latents]
-            
+
             # prepare input for policy
             joint_first = his_joint[-1][0]
             state_first = his_eef[-1][0]
@@ -286,14 +297,14 @@ if __name__ == "__main__":
                 video_first = [v[-1] for v in video_dict_pred]
             assert joint_first.shape == (8,), f"Expected joint_first shape (8,), got {joint_first.shape}"
             assert state_first.shape == (7,), f"Expected state_first shape (7,), got {state_first.shape}"
-            
+
             # forward policy
             print("################ policy forward ####################")
             # in the trajectory replay model, we use action recorded in trajetcory
             cartesian_pose = eef_gt[start_id:end_id]  # (pred_step, 7)
             print("cartesian space action", cartesian_pose[0]) # output xyz and gripper for debug
             print("cartesian space action", cartesian_pose[-1]) # output xyz and gripper for debug
-            
+
             print("################ world model forward ################")
             print(f'traj_id:{val_id_i}, interact step: {i}/{interact_num}')
             # retrive history cond and action cond
@@ -305,8 +316,24 @@ if __name__ == "__main__":
             assert current_latent.shape == (1, 4, 72, 40), f"Expected current_latent shape (1, 4, 72, 40), got {current_latent.shape}"
             assert action_cond.shape == (int(num_history+num_frames), 7), f"Expected action_cond shape ({int(num_history+num_frames)}, 7), got {action_cond.shape}"
             assert his_cond_input.shape == (1, int(num_history), 4, 72, 40), f"Expected his_cond_input shape (1, {int(num_history)}, 72, 40), got {his_cond_input.shape}"
-            # forward world model
+            # forward world model 기존 forward_wm 호출
             videos_cat, true_videos, video_dict_pred, predicted_latents = Agent.forward_wm(action_cond, video_latent_true, current_latent, his_cond=his_cond_input,text=text_i if Agent.args.text_cond else None)
+
+            '''# ── SAM3 Tracker: 생성된 프레임에서 mask 갱신 ────
+            # video_dict_pred: (3, pred_step, H, W, 3) - 3뷰, pred_step 프레임
+            # 첫 번째 뷰(third-person)의 마지막 프레임 사용
+            generated_frame = video_dict_pred[0][-1]  # (H, W, 3) uint8
+
+            sam3_results = Agent.sam3.update(generated_frame)
+
+            # 부재 감지 시 처리
+            absent_objects = {
+                name: res for name, res in sam3_results.items()
+                if res["absent"]
+            }
+            if absent_objects:
+                print(f"[Step {i}] Absent objects: "
+                    f"{[(n, r['cause']) for n, r in absent_objects.items()]}")'''
 
             print("################ record information ################")
             # push current step to history buffer
@@ -316,8 +343,8 @@ if __name__ == "__main__":
                 video_to_save.append(videos_cat)  # save all frames for the last interaction step
             else:
                 video_to_save.append(videos_cat[:pred_step-1]) # last frame is the first frame of next step, so we remove it here
-                
-        
+
+
         # save rollout video and info with parameters
         video = np.concatenate(video_to_save, axis=0)
         task_name = args.task_name
@@ -333,5 +360,5 @@ if __name__ == "__main__":
 
 
 # CUDA_VISIBLE_DEVICES=0 python rollout_replay_traj.py
-        
-        
+
+
